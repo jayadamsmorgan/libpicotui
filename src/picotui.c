@@ -31,8 +31,31 @@ struct pico_t {
     pico_render_fn render;
     void *render_ud;
 
+    /* Explicit caps for save/restore cursor (used ONLY for the stream area) */
+    const char *cap_sav; /* save_cursor */
+    const char *cap_res; /* restore_cursor */
+
+    /* Stream (top) anchor uses terminal save/restore slot */
+    int have_saved_cursor; /* 0/1: active saved cursor position */
+
+    /* UI-region anchor: DO NOT use terminal save/restore (it clashes with
+       stream). We track a relative cursor (row/col in the UI region) ourselves.
+     */
+    int ui_anchor_set; /* 0/1: we have a known UI cursor */
+    int ui_cur_row;    /* relative to UI top, 0..ui_rows-1 */
+    int ui_cur_col;    /* 0..cols-1 */
+
     volatile sig_atomic_t resized;
 };
+
+static void reprogram_region_and_redraw(pico_t *ui);
+
+static void handle_resize_if_needed(pico_t *ui) {
+    if (!ui->resized)
+        return;
+    ui->resized = 0;
+    reprogram_region_and_redraw(ui);
+}
 
 static pico_t *g_ui_singleton = NULL;
 
@@ -51,23 +74,33 @@ static void write_str(const char *s, size_t n) {
 }
 static void write_cstr(const char *s) { write_str(s, strlen(s)); }
 
+/* FIX: Never reuse a va_list after it was consumed. Take a copy for sizing,
+   and another copy for the real print. */
 static void write_vprintf(const char *prefix, const char *fmt, va_list ap) {
     char stack[1024];
-    int n = vsnprintf(stack, sizeof(stack), fmt, ap);
     if (prefix)
         write_cstr(prefix);
+
+    va_list ap1;
+    va_copy(ap1, ap);
+    int n = vsnprintf(stack, sizeof(stack), fmt, ap1);
+    va_end(ap1);
+
     if (n >= 0 && (size_t)n < sizeof(stack)) {
         write_str(stack, (size_t)n);
         return;
     }
+
     size_t need = (n > 0 ? (size_t)n + 1 : 4096);
     char *buf = malloc(need);
     if (!buf)
         return;
+
     va_list ap2;
     va_copy(ap2, ap);
     vsnprintf(buf, need, fmt, ap2);
     va_end(ap2);
+
     write_cstr(buf);
     free(buf);
 }
@@ -151,6 +184,24 @@ static void emit_el(pico_t *ui) {
     write_cstr("\x1b[K");
 }
 
+static void emit_save_cursor(pico_t *ui) {
+    if (ui->cap_sav) {
+        write_cstr(ui->cap_sav);
+        return;
+    }
+    /* CSI s is widely supported; (DEC 7 is "\x1b7") */
+    write_cstr("\x1b[s");
+}
+
+static void emit_restore_cursor(pico_t *ui) {
+    if (ui->cap_res) {
+        write_cstr(ui->cap_res);
+        return;
+    }
+    /* CSI u (DEC 8 would be "\x1b8") */
+    write_cstr("\x1b[u");
+}
+
 /* ---------- colors (16-color fg/bg) ---------- */
 static int clamp16(int v) { return v < 0 ? -1 : (v > 15 ? 15 : v); }
 
@@ -196,6 +247,7 @@ static void set_scroll_region(pico_t *ui, int top0, int bot0) {
     emit_csr(ui, top0, bot0);
 }
 static void reset_scroll_region(pico_t *ui) {
+    /* Full screen region */
     set_scroll_region(ui, 0, ui->sz.rows - 1);
 }
 
@@ -216,36 +268,169 @@ static void clear_ui_region(pico_t *ui) {
     }
 }
 
-void pico_ui_puts(pico_t *ui, int rel_row, int col, const char *s) {
-    int base = ui->sz.rows - ui->ui_rows;
-    if (base < 0)
-        base = 0;
-    int r = base + (rel_row < 0 ? 0 : rel_row);
-    if (r >= ui->sz.rows)
-        return;
+/* ------------ UI cursor math (track our own Y/X; don't use save/restore) ---
+ */
+
+/* Advance a column by rendering of ASCII text; tabs advance to 8-column stops.
+   We keep it simple: no wide glyphs/combining handling. */
+static int advance_col_text(int start_col, const char *s, int term_cols) {
+    int col = start_col;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        unsigned char ch = *p;
+        if (ch == '\n' || ch == '\r') {
+            col = 0;
+            continue;
+        }
+        if (ch == '\t') {
+            int next = ((col / 8) + 1) * 8;
+            col = next;
+            continue;
+        }
+        if (ch >= 0x20 && ch != 0x7f)
+            col += 1;
+        if (col >= term_cols) {
+            col = term_cols - 1;
+            break;
+        }
+    }
     if (col < 0)
         col = 0;
-    emit_cup(ui, r, col);
-    write_cstr(s);
+    return col;
 }
 
-void pico_ui_printf(pico_t *ui, int rel_row, int col, const char *fmt, ...) {
+static void ui_move_abs(pico_t *ui, int rel_row, int col) {
     int base = ui->sz.rows - ui->ui_rows;
     if (base < 0)
         base = 0;
-    int r = base + (rel_row < 0 ? 0 : rel_row);
+    int r = base + rel_row;
+    if (r < 0)
+        r = 0;
     if (r >= ui->sz.rows)
-        return;
+        r = ui->sz.rows - 1;
     if (col < 0)
         col = 0;
     emit_cup(ui, r, col);
-    va_list ap;
-    va_start(ap, fmt);
-    write_vprintf(NULL, fmt, ap);
-    va_end(ap);
+}
+
+/* ------------ Public UI API (YX and append variants) -----------------------
+ */
+
+void pico_ui_puts_yx(pico_t *ui, int rel_row, int col, const char *s) {
+    handle_resize_if_needed(ui); /* FIX: handle resize here too */
+    if (!s)
+        return;
+    if (rel_row < 0)
+        rel_row = 0;
+    if (col < 0)
+        col = 0;
+
+    ui_move_abs(ui, rel_row, col);
+    write_cstr(s);
+
+    /* Update our tracked UI cursor */
+    ui->ui_anchor_set = 1;
+    ui->ui_cur_row = rel_row;
+    ui->ui_cur_col = advance_col_text(col, s, ui->sz.cols);
+}
+
+void pico_ui_printf_yx(pico_t *ui, int rel_row, int col, const char *fmt, ...) {
+    handle_resize_if_needed(ui);
+    if (rel_row < 0)
+        rel_row = 0;
+    if (col < 0)
+        col = 0;
+
+    /* Format to stack or heap to compute new col */
+    char stack[1024];
+    va_list ap1;
+    va_start(ap1, fmt);
+    int n = vsnprintf(stack, sizeof(stack), fmt, ap1);
+    va_end(ap1);
+
+    if (n >= 0 && (size_t)n < sizeof(stack)) {
+        ui_move_abs(ui, rel_row, col);
+        write_str(stack, (size_t)n);
+        ui->ui_anchor_set = 1;
+        ui->ui_cur_row = rel_row;
+        ui->ui_cur_col = advance_col_text(col, stack, ui->sz.cols);
+        return;
+    }
+
+    size_t need = (n > 0 ? (size_t)n + 1 : 4096);
+    char *buf = malloc(need);
+    if (!buf)
+        return;
+
+    va_list ap2;
+    va_start(ap2, fmt);
+    vsnprintf(buf, need, fmt, ap2);
+    va_end(ap2);
+
+    ui_move_abs(ui, rel_row, col);
+    write_cstr(buf);
+
+    ui->ui_anchor_set = 1;
+    ui->ui_cur_row = rel_row;
+    ui->ui_cur_col = advance_col_text(col, buf, ui->sz.cols);
+
+    free(buf);
+}
+
+/* Ensure we have a starting UI anchor; default to (0,0) in the UI region. */
+static void ensure_ui_anchor(pico_t *ui) {
+    if (!ui->ui_anchor_set) {
+        ui->ui_anchor_set = 1;
+        ui->ui_cur_row = 0;
+        ui->ui_cur_col = 0;
+    }
+}
+
+void pico_ui_puts(pico_t *ui, const char *s) {
+    handle_resize_if_needed(ui);
+    if (!s || !*s)
+        return;
+    ensure_ui_anchor(ui);
+    ui_move_abs(ui, ui->ui_cur_row, ui->ui_cur_col);
+    write_cstr(s);
+    ui->ui_cur_col = advance_col_text(ui->ui_cur_col, s, ui->sz.cols);
+}
+
+void pico_ui_printf(pico_t *ui, const char *fmt, ...) {
+    handle_resize_if_needed(ui);
+    ensure_ui_anchor(ui);
+
+    char stack[1024];
+    va_list ap1;
+    va_start(ap1, fmt);
+    int n = vsnprintf(stack, sizeof(stack), fmt, ap1);
+    va_end(ap1);
+
+    if (n >= 0 && (size_t)n < sizeof(stack)) {
+        ui_move_abs(ui, ui->ui_cur_row, ui->ui_cur_col);
+        write_str(stack, (size_t)n);
+        ui->ui_cur_col = advance_col_text(ui->ui_cur_col, stack, ui->sz.cols);
+        return;
+    }
+
+    size_t need = (n > 0 ? (size_t)n + 1 : 4096);
+    char *buf = malloc(need);
+    if (!buf)
+        return;
+
+    va_list ap2;
+    va_start(ap2, fmt);
+    vsnprintf(buf, need, fmt, ap2);
+    va_end(ap2);
+
+    ui_move_abs(ui, ui->ui_cur_row, ui->ui_cur_col);
+    write_cstr(buf);
+    ui->ui_cur_col = advance_col_text(ui->ui_cur_col, buf, ui->sz.cols);
+
+    free(buf);
 }
 
 void pico_ui_clear_line(pico_t *ui, int rel_row) {
+    handle_resize_if_needed(ui);
     int base = ui->sz.rows - ui->ui_rows;
     if (base < 0)
         base = 0;
@@ -254,17 +439,22 @@ void pico_ui_clear_line(pico_t *ui, int rel_row) {
         return;
     emit_cup(ui, r, 0);
     emit_el(ui);
+    /* Reset UI cursor to start of that line */
+    ui->ui_anchor_set = 1;
+    ui->ui_cur_row = (rel_row < 0 ? 0 : rel_row);
+    ui->ui_cur_col = 0;
 }
 
 void pico_redraw_ui(pico_t *ui) {
     clear_ui_region(ui);
     if (ui->render)
         ui->render(ui, ui->render_ud);
+    /* We don't know where you want to continue -> reset UI anchor */
+    ui->ui_anchor_set = 0;
 }
 
+/* Re-query size, clamp ui_rows, re-apply region, redraw. */
 static void reprogram_region_and_redraw(pico_t *ui) {
-    /* Give control back, re-query size, clamp ui_rows, re-apply region, redraw.
-     */
     reset_scroll_region(ui);
     ui->sz = get_term_size();
     if (ui->ui_rows < 1)
@@ -277,14 +467,13 @@ static void reprogram_region_and_redraw(pico_t *ui) {
     set_scroll_region(ui, 0, bot);
     pico_redraw_ui(ui);
     move_to_bottom_scroll_line(ui);
+
+    ui->have_saved_cursor = 0;
+    ui->ui_anchor_set = 0;
 }
 
-static void handle_resize_if_needed(pico_t *ui) {
-    if (!ui->resized)
-        return;
-    ui->resized = 0;
-    reprogram_region_and_redraw(ui);
-}
+/* ------------ lifecycle ----------------------------------------------------
+ */
 
 pico_t *pico_init(int ui_rows, pico_render_fn render, void *userdata) {
     pico_t *ui = calloc(1, sizeof(*ui));
@@ -302,8 +491,9 @@ pico_t *pico_init(int ui_rows, pico_render_fn render, void *userdata) {
         ui->cap_sgr0 = unibi_get_str(ui->ut, unibi_exit_attribute_mode);
         ui->cap_setaf = unibi_get_str(ui->ut, unibi_set_a_foreground);
         ui->cap_setab = unibi_get_str(ui->ut, unibi_set_a_background);
+        ui->cap_sav = unibi_get_str(ui->ut, unibi_save_cursor);
+        ui->cap_res = unibi_get_str(ui->ut, unibi_restore_cursor);
     }
-
     ui->sz = get_term_size();
 
     g_ui_singleton = ui;
@@ -328,6 +518,9 @@ void pico_attach(pico_t *ui) {
         bot = 0;
     set_scroll_region(ui, 0, bot);
     move_to_bottom_scroll_line(ui);
+
+    ui->have_saved_cursor = 0;
+    ui->ui_anchor_set = 0;
 }
 
 void pico_set_ui_rows(pico_t *ui, int ui_rows) {
@@ -340,13 +533,15 @@ void pico_set_ui_rows(pico_t *ui, int ui_rows) {
     if (ui_rows == ui->ui_rows)
         return;
 
+    ui->have_saved_cursor = 0;
+    ui->ui_anchor_set = 0;
+
     /* Release region, scroll to make room difference, then reapply */
     reset_scroll_region(ui);
 
     int delta = ui_rows - ui->ui_rows;
     ui->ui_rows = ui_rows;
 
-    /* If growing UI, push more fresh lines; if shrinking, just redraw lower. */
     if (delta > 0) {
         emit_cup(ui, ui->sz.rows - 1, 0);
         for (int i = 0; i < delta; ++i)
@@ -356,22 +551,42 @@ void pico_set_ui_rows(pico_t *ui, int ui_rows) {
     reprogram_region_and_redraw(ui);
 }
 
+/* ------------ stream printing (above UI) -----------------------------------
+ */
+
+static void ensure_stream_anchor(pico_t *ui) {
+    if (!ui->have_saved_cursor) {
+        /* First time in a while: anchor at bottom-of-scroll line col 0 */
+        move_to_bottom_scroll_line(ui);
+        emit_save_cursor(ui);
+        ui->have_saved_cursor = 1;
+    }
+}
+
 void pico_print(pico_t *ui, const char *text) {
     handle_resize_if_needed(ui);
-    move_to_bottom_scroll_line(ui);
+    ensure_stream_anchor(ui);
+
+    emit_restore_cursor(ui);
     if (text && *text)
         write_cstr(text);
+    emit_save_cursor(ui);
+
     if (ui->render)
         ui->render(ui, ui->render_ud);
 }
 
 void pico_printf(pico_t *ui, const char *fmt, ...) {
     handle_resize_if_needed(ui);
-    move_to_bottom_scroll_line(ui);
+    ensure_stream_anchor(ui);
+
+    emit_restore_cursor(ui);
     va_list ap;
     va_start(ap, fmt);
     write_vprintf(NULL, fmt, ap);
     va_end(ap);
+    emit_save_cursor(ui);
+
     if (ui->render)
         ui->render(ui, ui->render_ud);
 }
@@ -384,6 +599,7 @@ void pico_println(pico_t *ui, const char *line) {
     write_cstr("\r\n");
     if (ui->render)
         ui->render(ui, ui->render_ud);
+    ui->have_saved_cursor = 0; /* newline changes row; invalidate anchor */
 }
 
 void pico_printfln(pico_t *ui, const char *fmt, ...) {
@@ -396,35 +612,40 @@ void pico_printfln(pico_t *ui, const char *fmt, ...) {
     write_cstr("\r\n");
     if (ui->render)
         ui->render(ui, ui->render_ud);
+    ui->have_saved_cursor = 0;
 }
 
 void pico_print_block(pico_t *ui, const char *block) {
-    if (!block)
+    if (!block || !*block)
         return;
-    const char *p = block, *start = p;
-    while (*p) {
-        if (*p == '\n') {
-            char tmp[4096];
-            size_t len = (size_t)(p - start);
-            if (len >= sizeof(tmp))
-                len = sizeof(tmp) - 1;
-            memcpy(tmp, start, len);
-            tmp[len] = '\0';
-            pico_println(ui, tmp);
-            start = p + 1;
-        }
-        ++p;
+
+    handle_resize_if_needed(ui);
+
+    /* Append starting at the current stream cursor anchor */
+    ensure_stream_anchor(ui);
+    emit_restore_cursor(ui);
+
+    /* Write the entire block as-is (let the terminal handle newlines) */
+    write_cstr(block);
+
+    /* If the block ends with '\n', the cursor moved to the next line start.
+       To match println() semantics, invalidate the anchor so the next
+       stream print starts at the bottom-of-scroll line. Otherwise, save
+       the new end position so subsequent pico_print/printf will append. */
+    size_t len = strlen(block);
+    if (len > 0 && block[len - 1] == '\n') {
+        ui->have_saved_cursor = 0;
+    } else {
+        emit_save_cursor(ui);
+        ui->have_saved_cursor = 1;
     }
-    if (start != p) {
-        char tmp[4096];
-        size_t len = (size_t)(p - start);
-        if (len >= sizeof(tmp))
-            len = sizeof(tmp) - 1;
-        memcpy(tmp, start, len);
-        tmp[len] = '\0';
-        pico_println(ui, tmp);
-    }
+
+    if (ui->render)
+        ui->render(ui, ui->render_ud);
 }
+
+/* ------------ shutdown/free ------------------------------------------------
+ */
 
 void pico_shutdown(pico_t *ui) {
     if (!ui)
@@ -447,13 +668,15 @@ void pico_free(pico_t *ui) {
 int pico_ui_rows(const pico_t *ui) { return ui->ui_rows; }
 int pico_cols(const pico_t *ui) { return ui->sz.cols; }
 
+/* NOTE: Signal handlers should be async-signal-safe; this one still calls
+   functions that may use snprintf etc. If you need strict safety, consider a
+   self-pipe/flag and exit from your main loop instead. */
 static void on_sigint(int sig) {
     (void)sig;
     if (g_ui_singleton) {
         pico_shutdown(g_ui_singleton);
         pico_reset_colors(g_ui_singleton);
     }
-    /* Move to last line and flush */
     write_cstr("\n");
     _exit(130); /* conventional Ctrl-C exit code */
 }
